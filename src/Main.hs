@@ -10,5 +10,9 @@ import           Data.List                 (intercalate)
 
 main :: IO ()
 main = do
-  putStr $ unlines $ map show $ M.toList $
-    topDownSolver (M.singleton EnrichedFuel 5)
+  let factories = iterativeSolver (M.fromList [(PetGas, 260)])
+  putStr $ unlines $ map show $ M.toList factories
+  putStrLn ""
+  putStr $ unlines $ map show $ M.toList (productionRate factories)
+  putStrLn ""
+  putStr $ unlines $ map show $ M.toList (netRate factories)

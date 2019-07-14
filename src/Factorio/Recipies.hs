@@ -1,9 +1,13 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections       #-}
+{-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE TupleSections         #-}
+{-# LANGUAGE TypeSynonymInstances  #-}
+{-# LANGUAGE UndecidableInstances  #-}
 
 module Factorio.Recipies where
 
-import           Control.Arrow         (second, (&&&), (***))
+import           Control.Arrow         (first, second, (&&&), (***))
 import           Data.List             (delete, sortBy)
 import           Data.Maybe
 import           Data.Ord              (comparing)
@@ -46,7 +50,9 @@ instance Show Machine where
   show (Machine t i _ _ _) = show t ++ show i
 
 
-data Product = Product Double Double Item deriving (Eq, Show, Ord)
+data Product = Product Double Double Item deriving (Eq, Ord)
+instance Show Product where
+  show (Product a _ i) = show a ++ "x " ++ show i
 data Ingredient = Ingredient Double Item deriving (Eq, Show, Ord)
 class RecipiePart r where
   amt :: r -> Double
@@ -73,12 +79,6 @@ data Factory = Factory {
     fMachine :: Machine,
     fProc    :: Process
   } deriving (Eq, Show, Ord)
-
-data Item =
-  Water | Air | Hydrogen | Nitrogen | Oxygen | PureWater | Amonia | Peroxide | NOx | NO2 | N2O4 | Hydrazine |
-  CrudeOil | HeavyOil | LightOil | PetGas |
-  Coal | LiquidFuel | EnrichedFuel | SolidFuel | RocketFuel
-  deriving (Eq, Show, Ord)
 
 type ItemCounts = M.Map Item Double
 
@@ -114,19 +114,35 @@ instance Production Factory where
   products =  products . fProc
   ingredients = ingredients . fProc
 
-productionRate :: Factory -> ItemCounts
-productionRate (Factory m pr) = let
-  -- FType Int Drain Productivity SpeedFactor
-  (Machine _ _ _ (Productivity p) (SpeedFactor s)) = m
-  (Process (Time t) _ _ ps) = pr
-  in M.fromList $ map (\x -> (itm x, (1+p) * amt x * s / t)) ps
+class ToDouble n where
+  toDouble :: n -> Double
+instance ToDouble Double where
+  toDouble = id
+instance ToDouble Int where
+  toDouble = fromIntegral
 
-needRate :: Factory -> ItemCounts
-needRate (Factory m pr) = let
-  -- FType Int Drain Productivity SpeedFactor
-  (Machine _ _ _ _ (SpeedFactor s)) = m
-  (Process (Time t) _ is _) = pr
-  in M.fromList $ map (\x -> (itm x, amt x * s / t)) is
+class ProductionRate p  where
+    needRate :: p -> ItemCounts
+    productionRate :: p -> ItemCounts
+    netRate :: p -> ItemCounts
+    netRate p = productionRate p - needRate p
+
+instance ProductionRate Factory where
+  productionRate (Factory m pr) = let
+    -- FType Int Drain Productivity SpeedFactor
+    (Machine _ _ _ (Productivity p) (SpeedFactor s)) = m
+    (Process (Time t) _ _ ps) = pr
+    in M.fromList $ map (\x -> (itm x, (1+p) * amt x * s / t)) ps
+
+  needRate (Factory m pr) = let
+    -- FType Int Drain Productivity SpeedFactor
+    (Machine _ _ _ _ (SpeedFactor s)) = m
+    (Process (Time t) _ is _) = pr
+    in M.fromList $ map (\x -> (itm x, amt x * s / t)) is
+
+instance (ToDouble n) => ProductionRate (M.Map Factory n) where
+  productionRate fs = sum $ uncurry (*:) <$> ((productionRate *** toDouble) <$> M.toList fs)
+  needRate fs = sum $ uncurry (*:) <$> ((needRate *** toDouble) <$> M.toList fs)
 
 isRaw :: Process -> Bool
 isRaw (Process _ _ is _) = not $ null is
@@ -175,17 +191,27 @@ factoriesByItemPrio = let
   sortOnPrio i = sortBy (comparing (productPrio . getProduct i))
   in M.mapWithKey sortOnPrio factoriesByItem
 
+preferedFactory :: Item -> Factory
+preferedFactory = head . (factoriesByItemPrio M.!)
 
 addToCount :: [(Item, Double)] -> ItemCounts -> ItemCounts
 addToCount xs m = foldl (flip (uncurry $ M.insertWith (+))) m xs
 
 {- Annealing -}
 
-addMaps :: (Num n, Ord k) => M.Map k n -> M.Map k n -> M.Map k n
-addMaps = merge preserveMissing (mapMissing (\_ x -> x)) (zipWithMatched $ const (+))
+instance (Ord a, Num n) => Num (M.Map a n) where
+  (+) = merge preserveMissing (mapMissing (\_ x -> x)) (zipWithMatched $ const (+))
+  (-) = merge preserveMissing (mapMissing (\_ x -> -x)) (zipWithMatched $ const (-))
+  (*) = merge dropMissing dropMissing (zipWithMatched $ const (*))
+  negate = M.map negate
+  abs = M.map abs
+  signum = M.map signum
+  fromInteger 0 = M.empty
+  fromInteger _ = error "No logical map for a nonzero number"
 
-diffMaps :: (Num n, Ord k) => M.Map k n -> M.Map k n -> M.Map k n
-diffMaps = merge preserveMissing (mapMissing (\_ x -> -x)) (zipWithMatched $ const (-))
+(*:) :: (Ord a, Num n) => M.Map a n -> n -> M.Map a n
+(*:) m n = M.map (*n) m
+infixl 7 *:
 
 factoryToRates :: (Factory -> ItemCounts) -> Factory -> Double -> ItemCounts
 factoryToRates toCt f ct = M.map (* ct) $ toCt f
@@ -193,7 +219,7 @@ factoryToRates toCt f ct = M.map (* ct) $ toCt f
 factoriesToRates :: (Factory -> ItemCounts) -> FactoryFloat -> ItemCounts
 factoriesToRates toCt fs = let
   counts = uncurry (factoryToRates toCt) <$> M.toList fs
-  in foldl addMaps M.empty counts
+  in sum counts
 
 
 factoriesToNeeds :: FactoryFloat -> ItemCounts
@@ -206,8 +232,8 @@ factoriesToEnergy = M.foldlWithKey' (\a k b -> a + (drain.mDrain.fMachine) k * f
 
 topDownSolver :: ItemCounts -> FactoryCounts
 topDownSolver initialNeeds = let
-  iToF = head . (factoriesByItemPrio M.!)
-  needF ct fs = M.map (* ct) $ addMaps (factoriesToNeeds fs) initialNeeds
+  iToF = preferedFactory
+  needF ct fs = M.map (* ct) $ factoriesToNeeds fs + initialNeeds
   recursiveSolve :: Item -> Double -> FactoryFloat
   recursiveSolve i rate = let
     fac = iToF i
@@ -215,31 +241,60 @@ topDownSolver initialNeeds = let
     myFac = M.singleton fac facCt
     facNeeds = M.toList $ factoriesToNeeds myFac
     needMaps = uncurry recursiveSolve <$> facNeeds
-    in foldl addMaps myFac needMaps
+    in foldl (+) myFac needMaps
   minimizeSolution :: FactoryCounts -> FactoryCounts
   minimizeSolution initalFacs = M.map ceiling $ go allKeys ffloats where
     allKeys = M.keys initalFacs
     ffloats = M.map fromIntegral initalFacs
     primaryItem = (itm &&& amt).head.pProduct.fProc
+    needsF f = initialNeeds + factoriesToNeeds f
+    makesF = factoriesToMakes
     go [] facs       = facs
     go (f : fs) facs = let
-      needs = addMaps initialNeeds $ factoriesToNeeds facs
-      makes = factoriesToMakes facs
-      itemTotals = M.filter (>0) $ diffMaps makes needs
+      itemTotals = makesF facs - needsF facs
       lessOne = M.insertWith (\a b -> max 0 (a-b)) f 1 facs
-      (item, ct) = primaryItem f
+      (item, fMakesCt) = primaryItem f
       itemExcess = fromMaybe (-1) (itemTotals M.!? item)
-      hasExcess  = (facs M.! f > 0) && (itemExcess - ct >= 0)
+      hasExcess  = (facs M.! f > 0) && (itemExcess - fMakesCt >= 0)
       in if hasExcess then
            go allKeys lessOne
          else
            go fs facs
-  in M.filter (>0)
-    $ minimizeSolution
-    $ M.map ceiling
-    $ foldl addMaps M.empty (uncurry recursiveSolve <$> M.toList initialNeeds )
+  in M.map ceiling
+    $ sum (uncurry recursiveSolve <$> M.toList initialNeeds )
+
+iterativeSolver :: ItemCounts -> FactoryCounts
+iterativeSolver initialNeeds = let
+  iToF = preferedFactory
+  needF :: FactoryCounts -> ItemCounts
+  needF fs = abs $ M.filter (< -0.001) $ netRate fs - initialNeeds
+  itr :: FactoryCounts -> FactoryCounts
+  itr fs
+    | haveAll   = fs
+    | otherwise = itr (fs + nFacs)
+    where
+      needs     = needF fs
+      firstNeed = head $ M.keys needs
+      firstRate = needs M.! firstNeed
+      nFacs     = let
+        f = iToF firstNeed
+        n = calculateNeededFactories f firstNeed firstRate
+        in M.singleton f (max 1 n)
+      haveAll   = M.null needs
+  in itr M.empty
 
 {- Game Data -}
+
+data Item =
+  Stone | Sulphur | Water | Air |
+  Hydrogen | Nitrogen | Oxygen | PureWater | Amonia | Peroxide |
+  Salt | NaOH | Chlorine | Plastic |
+  NOx | NO2 | N2O4 | Hydrazine | SO2 | H2SO4 |
+  CrudeOil | HeavyOil | LightOil | PetGas |
+  Coal | LiquidFuel | EnrichedFuel | SolidFuel | RocketFuel |
+  IronOre | Iron | Steel | CopperOre | Copper | NickelOre | Nickel | LeadOre | LeadOxide | Lead |
+  CobaltOre | CobaltOxide | Cobalt
+  deriving (Eq, Show, Ord)
 
 machines :: [Machine]
 machines = ( (\(t, g, d, s) -> Machine t g (Drain d) (Productivity 0) (SpeedFactor s)) <$> [
@@ -248,13 +303,13 @@ machines = ( (\(t, g, d, s) -> Machine t g (Drain d) (Productivity 0) (SpeedFact
     (Assembler, 3, 210 + 7, 1.25),
     (Electronics, 2, 213 + 7.1, 2.25),
     (Refinery, 1, 420 + 14, 1),
-    (Compressor, 1, 1.6 + 50, 1),
+    (Compressor, 2, 1.6 + 90, 2),
     (Pump, 1, 10, 1),
     (Chemical, 2, 259 + 8.6, 1.75),
     (Electro, 2, 750 + 25, 1.5),
     (Distil, 2, 259 + 8.6, 1.5),
-    (Furnace, 2, 90, 2),
-    (ChemFurnace, 2, 90, 2),
+    (Furnace, 2, 180 + 6, 2),
+    (ChemFurnace, 3, 180, 2),
     (MetalMixing, 2, 90, 2),
     (Greenhouse, 1, 100 + 3.3, 0.75)
   ])
@@ -266,53 +321,48 @@ processes :: [Process]
 processes = (\(ps, t, f, is) -> Process (Time t) f (uncurry Ingredient <$> is) ((\(a,b,c) -> Product a b c) <$> ps) ) <$>
   [
 -- ([(, )], 1, Chemical, [(, ), (, )]),
-  ([( 12, 10, HeavyOil)],                  2.5, Chemical, [(2, Coal), (15, Water)]),
-  ([( 20, 10,  Amonia)],                    1,   Chemical, [(10, Nitrogen), (24, Hydrogen)]),
-  ([(  8, 10,  N2O4)],                      1,   Chemical, [(20, NOx)]),
-  ([(  8, 10,  Hydrazine), (4, 1000, PureWater)], 1,   Chemical, [(20, Amonia), (4, Peroxide)]),
-  ([(  8, 10,  Peroxide)],                  1,   Chemical, [(16, Hydrogen), (20, Oxygen)]),
-  ([( 20, 10,  NOx), (12, 1000, PureWater)],      1,   Chemical, [(20, Amonia), (25, Oxygen)]),
+  ([( 12, 10,  HeavyOil)],                2.5,   Chemical, [(2, Coal), (15, Water)]),
   ([( 30, 10,  LightOil)],                  2,   Chemical, [(30, Water), (40, HeavyOil)]),
   ([( 20, 10,  PetGas)],                    2,   Chemical, [(30, Water), (30, LightOil)]),
+  ([( 20, 10,  Amonia)],                    1,   Chemical, [(10, Nitrogen), (24, Hydrogen)]),
+  ([(  8, 10,  N2O4)],                      1,   Chemical, [(20, NO2)]),
+  ([(  8, 10,  Hydrazine), (4, 1000, PureWater)], 1,   Chemical, [(20, Amonia), (4, Peroxide)]),
+  ([(  8, 10,  Peroxide)],                  1,   Chemical, [(16, Hydrogen), (20, Oxygen)]),
+  ([( 20, 10,  NOx), (12, 1000, PureWater)],1,   Chemical, [(20, Amonia), (25, Oxygen)]),
   ([( 20, 10,  NO2)],                       1,   Chemical, [(20, NOx), (10, Oxygen)]),
   ([(100, 10,  PureWater)],                 2,   Distil,   [(100, Water)]),
-  ([( 20, 10,  Hydrogen), (12.5, 10, Oxygen)],  1,   Electro,  [(10, PureWater)]),
+  ([( 20, 20,  Hydrogen), (12.5, 10, Oxygen)],  1,   Electro,  [(10, PureWater)]),
   ([( 20, 10,  Nitrogen), (5, 20, Oxygen)],     1,   Chemical, [(25, Air)]),
   ([(250, 10,  Hydrogen)],                  2.5, Chemical, [(5, Water), (5, PetGas)]),
 
-  ([(  1, 10,  RocketFuel)],               30,  Chemical,  [(160, Hydrazine), (80, N2O4)]),
-  ([( 10, 10,  LiquidFuel)],                1,  Chemical,  [(10, LightOil)]),
-  ([(  1, 10,  EnrichedFuel)],             12,  Chemical,  [(1, LiquidFuel)]),
-  ([(  1, 10,  SolidFuel)],                 2,  Chemical,  [(10, LightOil)]),
-  ([(  1, 20,  EnrichedFuel)],             12,  Chemical,  [(1, SolidFuel), (200, Hydrazine)]),
-  ([(  1, 10,  SolidFuel)],                 3,  Chemical,  [(1, Coal), (175, Hydrogen)]),
+  ([(  1, 10,  RocketFuel)],               30,   Chemical,  [(160, Hydrazine), (80, N2O4)]),
+  ([( 10, 10,  LiquidFuel)],                1,   Chemical,  [(10, LightOil)]),
+  ([(  1, 10,  EnrichedFuel)],             12,   Chemical,  [(20, LiquidFuel)]),
+  ([(  1, 10,  SolidFuel)],                 2,   Chemical,  [(10, LightOil)]),
+  ([(  1, 20,  EnrichedFuel)],             12,   Chemical,  [(1, SolidFuel), (200, Hydrazine)]),
+  ([(  1, 10,  SolidFuel)],                 3,   Chemical,  [(1, Coal), (175, Hydrogen)]),
 
-  ([(1, 10, Coal)],     1, Mining, []),
-  ([(1200, 10, Water)], 1, Pump, []),
-  ([(100, 10, Air)],    1, Compressor, [])
+  ([(  1, 10,  Iron)],                   3.2,    Furnace,      [(1, IronOre)]),
+  ([(  1, 10,  Steel)],                  3.2,    ChemFurnace,  [(1, Iron), (10, Oxygen)]),
+
+  ([(  1, 10,  Nickel), (10, 30, SO2)],  3.2,    Electro,      [(1, NickelOre), (8, Oxygen)]),
+  ([(  1, 10,  H2SO4)],                    1,    Chemical,     [(50, Water), (50, SO2)]),
+
+  ([(  2, 10,  CobaltOxide)],              7,    ChemFurnace,  [(2, CobaltOre), (1, Stone)]),
+  ([(  1, 10,  Cobalt)],                 3.2,    ChemFurnace,  [(1, CobaltOxide), (10, H2SO4)]),
+
+  ([(25, 10, Chlorine), (20, 30, Hydrogen), (1, 10, NaOH)],
+                                           2,    Electro,      [(10, PureWater), (1, Salt)]),
+  ([(50, 10, SO2)],                        1,    Chemical,     [(5, Sulphur), (50, Oxygen)]),
+  ([(1, 10, Salt)],                      0.5,    ChemFurnace,  [(25, Water)]),
+  ([(2, 10, Plastic)],                     1,    Chemical,     [(20, PetGas), (10, Chlorine)]),
+
+  ([(1,    10, Coal)],                     1,    Mining, []),
+  ([(1200, 10, Water)],                    1,    Pump, []),
+  ([(100,  10, Air)],                      1,    Compressor, []),
+  ([(1,    10, IronOre)],                  1,    Mining, []),
+  ([(1,    10, NickelOre), (1, 10, LeadOre)],  1/0.75, Mining, []),
+  ([(1,    10, CobaltOre)],                1,    Mining, []),
+  ([(1,    10, Stone)],                    1,    Mining, []),
+  ([(1,    10, Sulphur)],                  1,    Mining, [])
   ]
-
-
-
-
-
-
-
--- data Errors err a = Proc a | Missing [err]
--- getErrs :: Errors err a -> [err]
--- getErrs (Missing errs) = errs
--- getErrs _              = []
--- instance Functor (Errors err) where
---   fmap f = go where
---     go (Proc a)     = Proc $ f a
---     go (Missing es) = Missing es
--- instance Applicative (Errors err) where
---   pure = Proc
---   ff <*> fa = go ff fa where
---     go z (Missing es)    = Missing (getErrs z ++ es)
---     go (Missing es) z    = Missing (es ++ getErrs z)
---     go (Proc f) (Proc a) = Proc (f a)
--- instance Monad (Errors err) where
---   return = pure
---   (Missing es) >>= _ = Missing es
---   (Proc a) >>= f     = f a
