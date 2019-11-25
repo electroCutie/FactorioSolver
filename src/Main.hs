@@ -1,18 +1,17 @@
 module Main where
 
-import           Control.Monad.Random.Lazy
-import qualified Data.Map.Strict           as M
-import           Factorio.Anneal
 import           Factorio.Recipies
 
-import           Data.List                 (intercalate)
+import qualified Data.Map.Strict   as M
 
+
+factories :: [RecursiveFactory]
+factories = M.elems $ recursiveSolver (M.fromList [
+    (SpaceSci, 1000/350)
+    -- (PurpleSci, 1000/350), (YellowSci, 1000/350),
+    -- (RedSci, 1000/350), (GreenSci, 1000/350)
+  ])
 
 main :: IO ()
 main = do
-  let factories = iterativeSolver (M.fromList [(PetGas, 260)])
-  putStr $ unlines $ map show $ M.toList factories
-  putStrLn ""
-  putStr $ unlines $ map show $ M.toList (productionRate factories)
-  putStrLn ""
-  putStr $ unlines $ map show $ M.toList (netRate factories)
+  putStrLn $ showRecursiveFactories factories
