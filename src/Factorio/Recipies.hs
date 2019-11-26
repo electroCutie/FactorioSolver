@@ -151,11 +151,13 @@ instance (ToDouble n) => ProductionRate (M.Map Factory n) where
   productionRate fs = sum $ uncurry (*:) <$> ((productionRate *** toDouble) <$> M.toList fs)
   needRate fs = sum $ uncurry (*:) <$> ((needRate *** toDouble) <$> M.toList fs)
 
+type RecursiveFactories = M.Map Factory RecursiveFactory
+
 data RecursiveFactory = RecursiveFactory {
     rfFactory  :: Factory,
     rfCt       :: Double,
-    rfChildren :: M.Map Factory RecursiveFactory
-  }
+    rfChildren :: RecursiveFactories
+  } deriving Show
 
 shouldSummarize :: RecursiveFactory -> Bool
 shouldSummarize = pSummarize . fProc . rfFactory
@@ -181,7 +183,6 @@ showRecursiveFactories roots = printf "%s\n ---\n%s" (intercalate "\n" $ sh Noth
   showFacFrac :: Maybe Double -> (Factory, Double) -> String
   showFacFrac Nothing (f, d) = printf "%sx %s %s" (xCt d) (show $ fMachine f) outs where
     outs = showR  $ productionRate f *: d
-
   showFacFrac (Just parentCt) (f, d) = printf "|%s%sx %s %s" ratio (xCt d) (show $ fMachine f) outs where
     outs = showR  $ productionRate f *: d
     ratio
@@ -195,12 +196,16 @@ showRecursiveFactories roots = printf "%s\n ---\n%s" (intercalate "\n" $ sh Noth
     leadingSpaces = replicate (level * 2) ' '
     myShow = showFacFrac pCt (f,ct) ++ shortsumChildren
     showChildren = sh (Just ct) (level+1) <$> notSum rf
-    shortsumChildren  = case (showR . sum) $ productionRate <$> onlySum rf of
+    shortsumChildren  = case (showR . sum) $ (flip M.intersection (needRate f) . productionRate) <$> onlySum rf of
                            [] -> ""
                            s  -> " ← {"++s++"}"
+    -- shortSumNeeds = case showR $ needRate rf of
+    --                        [] -> ""
+    --                        s  -> " ← {"++s++"}"
     in leadingSpaces ++ intercalate "\n" (myShow : showChildren)
   addToRfCt :: RecursiveFactory -> RecursiveFactory -> RecursiveFactory
-  addToRfCt (RecursiveFactory f ct ch) b = RecursiveFactory f (ct + rfCt b) ch
+  addToRfCt a@(RecursiveFactory f ctA chA) b@(RecursiveFactory _ ctB chB) = RecursiveFactory f (ctA + ctB) merged where
+    merged = M.unionWith addToRfCt chA chB
   summarize = let
     findS :: RecursiveFactory -> [RecursiveFactory]
     findS rf = onlySum rf ++ ((M.elems . rfChildren) rf >>= findS)
@@ -212,8 +217,8 @@ instance Production RecursiveFactory where
   ingredients (RecursiveFactory f _ _) = ingredients f
 
 instance ProductionRate RecursiveFactory where
-  needRate (RecursiveFactory f ct ch) = needRate ch + needRate f *: ct
-  productionRate (RecursiveFactory f ct ch) = productionRate ch + productionRate f *: ct
+  needRate (RecursiveFactory f ct _) = needRate f *: ct
+  productionRate (RecursiveFactory f ct _) = productionRate f *: ct
 
 findProcesses :: Item -> [Process] -> ([Process], [Process])
 findProcesses i ps = let
@@ -283,22 +288,17 @@ instance (Ord a, Fractional n) => Fractional (M.Map a n) where
   fromRational = error "no sane value for a map with no key"
   (/) = merge dropMissing dropMissing (zipWithMatched $ const (/))
 
-class Num n => InternalNum m n where
+class Num n => Multiplicable m n where
   internalNumOp :: (n -> n) -> m -> m
   (*:) :: m -> n -> m
   (*:) m n = internalNumOp (* n) m
-  (+:) :: m -> n -> m
-  (+:) m n = internalNumOp (+ n) m
-  (-:) :: m -> n -> m
-  (-:) m n = internalNumOp (flip (-) n) m
 infixl 7 *:
-infixl 6 +:
-infixl 6 -:
 
-instance (Ord k, Num n) => InternalNum (M.Map k n) n where
+instance (Ord k, Num n) => Multiplicable (M.Map k n) n where
   internalNumOp = M.map
-instance InternalNum RecursiveFactory Double where
-  internalNumOp f (RecursiveFactory fa ct ch) = RecursiveFactory fa (f ct) ch
+
+instance Multiplicable RecursiveFactory Double where
+  internalNumOp f (RecursiveFactory fa ct ch) = RecursiveFactory fa (f ct) (M.map (internalNumOp f) ch)
 
 
 factoryToRates :: (Factory -> ItemCounts) -> Factory -> Double -> ItemCounts
@@ -318,38 +318,34 @@ factoriesToMakes = factoriesToRates productionRate
 factoriesToEnergy :: FactoryCounts -> Double
 factoriesToEnergy = M.foldlWithKey' (\a k b -> a + (drain.mDrain.fMachine) k * fromIntegral b ) 0
 
--- recursiveSolver :: ItemCounts -> M.Map Factory RecursiveFactory
--- recursiveSolver intialNeeds = let
---   toRec :: (Item, Double) -> RecursiveFactory
---   toRec (item, rate) = let
---     myFactory = preferedFactory item
---     neededFactories = calculateNeededFactoriesFrac myFactory item rate
---     myNeeds = abs $ M.filter (< -0.001) $ netRate myFactory *: neededFactories
---     myChildren = recursiveSolver myNeeds
---     in RecursiveFactory myFactory neededFactories myChildren
---   needsList = M.toList intialNeeds
---   results = toRec <$> needsList
---   rfToTuple r = (rfFactory r, r)
---   in M.fromList $ rfToTuple <$> results
-
-recursiveSolver :: ItemCounts -> M.Map Factory RecursiveFactory
+recursiveSolver :: ItemCounts -> RecursiveFactories
 recursiveSolver = go where
-  go needs = M.mapWithKey goRec $ itr needs M.empty
-  goRec f ct = RecursiveFactory f ct $ go $ needRate f *: ct
-  itr :: ItemCounts -> FactoryFloat -> FactoryFloat
+  go :: ItemCounts -> RecursiveFactories
+  go needs = itr needs M.empty
+  -- goRec f ct = RecursiveFactory f ct $ go (traceShow "--" $ traceShow f traceShow ct $ traceShowId $ needRate f *: ct)
+  goRec f ct = RecursiveFactory f ct $ go (needRate f *: ct)
+  netRateRec rf = netRate rf + (netRateRecM . rfChildren) rf
+  netRateRecM fs = sum (netRateRec <$> M.elems fs)
+  netProductionRec = M.filter (> 0.001) . netRateRec
+  netProductionRecM = M.filter (> 0.001) . netRateRecM
+  itr :: ItemCounts -> RecursiveFactories -> RecursiveFactories
   itr needs factories
     | haveAll   = factories
     | otherwise = itr needs factories'
     where
-      myRate           = productionRate factories :: ItemCounts
-      remainingNeeds   = M.filter (> 0) (needs - myRate)
-      firstNeeedType   = preferedFactory $ head (M.keys remainingNeeds)
+      myRate           = netProductionRecM factories :: ItemCounts
+      remainingNeeds   = M.filter (> 0.001) (needs - myRate)
+      firstNeedItem    = head (M.keys remainingNeeds)
+      firstNeedType    = preferedFactory firstNeedItem
       haveAll          = M.null remainingNeeds
-      oneChild         = goRec firstNeeedType 1
-      childAmountToAdd = maximum $ M.elems $ remainingNeeds / productionRate oneChild :: Double
-      addSome Nothing  = Just childAmountToAdd
-      addSome (Just d) = Just $ d + childAmountToAdd
-      factories'       = M.alter addSome firstNeeedType factories
+      oneChild         = goRec firstNeedType 1
+      childAmountToAdd = (remainingNeeds / netProductionRec oneChild) M.! firstNeedItem :: Double
+      addSome Nothing  = Just $ oneChild *: childAmountToAdd
+      addSome (Just d) = let
+        toMul = (childAmountToAdd + rfCt d) / rfCt d
+        in Just $ d *: toMul
+      factories' :: RecursiveFactories
+      factories'       = M.alter addSome firstNeedType factories
 
 
 iterativeSolver :: ItemCounts -> FactoryCounts
@@ -410,7 +406,8 @@ machines = ( (\(t, g, d, s) -> Machine t g (Drain d) (Productivity 0) (SpeedFact
     -- (Assembler, 1, 100 + 3.3, 0.5),
     -- (Assembler, 2, 135 + 4.5, 0.75),
     (Assembler, 3, 210 + 7, 1.25),
-    (Refinery, 1, 420 + 14, 1.6),
+    -- (Refinery, 1, 420 + 14, 1.6),
+    (Refinery, 1, 420 + 14, 1),
     (Pump, 1, 10, 1),
     (Chemical, 1, 259 + 8.6, 1),
     (Furnace, 3, 180 + 6, 2),
