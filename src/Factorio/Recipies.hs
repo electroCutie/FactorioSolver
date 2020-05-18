@@ -488,7 +488,7 @@ processes = (\(ps, t, f, is, sumarize) -> Process (Time t) f ((\(a,b,c) -> Produ
   ([( 20, 10,  PetGas)],                 2,   Chemical,    [(30, LightOil), (30, Water)], False),
   ([( 30, 10,  LightOil)],               2,   Chemical,    [(40, HeavyOil), (30, Water)], False),
   ([( 25, 30,  HeavyOil), ( 45, 30,  LightOil), ( 55, 30,  PetGas)], 5,   Refinery,     [(100, CrudeOil), (50, Water)], False),
-  ([( 65, 20,  HeavyOil), ( 20, 20,  LightOil), ( 10, 20,  PetGas)], 5,   Refinery,     [(10, Coal), (50, Steam)], False),
+  ([( 65, 20,  HeavyOil), ( 20, 20,  LightOil), ( 10, 20,  PetGas)], 5,   Refinery,     [(10, Coal), (50, Steam)], True),
 
   ([( 60, 10, Steam)],                  1,   Boiler,      [(0.45, Coal), (60, Water)], False),
 
